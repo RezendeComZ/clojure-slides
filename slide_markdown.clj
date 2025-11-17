@@ -6,8 +6,7 @@
             [clojure.java.io :as io]
             [markdown.core :as md])
   (:import [java.util Base64]
-           [java.io File FileInputStream ByteArrayOutputStream]
-           [java.net URLEncoder]))
+           [java.io FileInputStream ByteArrayOutputStream]))
 
 ;; --- Helper: CDN Asset Caching ---
 
@@ -32,486 +31,241 @@
 (defn- parse-slide-header
   "Parses the slide header (e.g., '[template-id] Title')."
   [header-line]
-  (let [pattern #"^\[([\w\d-]+)\]\s*(.*)$"
-        match (re-find pattern header-line)]
-    (if match
-      {:template-id (second match)
-       :title (when-not (str/blank? (nth match 2)) (nth match 2))}
-      {:template-id nil
-       :title (when-not (str/blank? header-line) header-line)})))
+  (let [[_ id title] (re-find #"^\[([\w\d-]+)\]\s*(.*)$" header-line)]
+    {:template-id id
+     :title (if (str/blank? title) header-line title)}))
 
 (defn- parse-slide-content
   "Parses a raw slide string into a structured map."
   [raw-slide]
-  (let [lines (str/split-lines raw-slide)
-        header-line (first lines)
-        content-str (str/join "\n" (rest lines))
+  (let [[header-line & rest-lines] (str/split-lines raw-slide)
+        content-str (str/join "\n" rest-lines)
         blocks (->> (str/split content-str #"\n\s*\n")
                     (map str/trim)
                     (remove str/blank?)
-                    (vec))]
-    (assoc (parse-slide-header header-line)
-           :markdown-blocks blocks)))
+                    vec)]
+    (assoc (parse-slide-header header-line) :markdown-blocks blocks)))
 
-(defn parse-smd-file
-  "Parses the .smd file content into a presentation map."
-  [file-content]
-  (let [parts (str/split file-content #"\nEND\n" 2)
-        edn-header (first parts)
-        slides-content (second parts)]
+(defn parse-smd-file [file-content]
+  (let [[edn-header slides-content] (str/split file-content #"\nEND\n" 2)]
     (when-not slides-content
       (throw (ex-info "Invalid .smd file: 'END' separator not found." {})))
-
     {:meta (edn/read-string edn-header)
      :slides (->> (str/split slides-content #"-\*-\*-\s*")
                   (remove str/blank?)
                   (map parse-slide-content)
-                  (vec))}))
+                  vec)}))
 
 ;; --- Validation Logic ---
 
-(defn- validate-templates
-  "Validates the :templates block in the metadata."
-  [templates]
-  (when (or (nil? templates) (empty? templates))
-    (throw (ex-info "Validation Failed: No templates found in EDN header." {})))
-
-  (let [ids (map :slide-template templates)]
-    (when (not (apply distinct? ids))
-      (throw (ex-info "Validation Failed: Template :slide-template IDs are not unique."
-                      {:ids ids})))
-    (when (some str/blank? ids)
-      (throw (ex-info "Validation Failed: Template :slide-template IDs cannot be blank." {})))))
-
-(defn- get-template-map
-  "Creates a lookup map for templates by their ID."
-  [templates]
-  (->> templates
-       (map (juxt :slide-template identity))
-       (into {})))
+(defn- get-template-map [templates]
+  (into {} (map (juxt :slide-template identity) templates)))
 
 (defn validate-presentation-data
-  "Validates the parsed presentation data."
   [{:keys [meta slides] :as presentation-data}]
-  (validate-templates (:templates meta))
+  (let [templates (:templates meta)]
+    (when (empty? templates)
+      (throw (ex-info "Validation Failed: No templates found." {})))
 
-  (let [template-map (get-template-map (:templates meta))
-        default-template-id (-> meta :templates first :slide-template)]
+    (let [template-map (get-template-map templates)
+          default-id (-> templates first :slide-template)]
 
-    (doseq [[i slide] (map-indexed vector slides)]
-      (let [template-id (or (:template-id slide) default-template-id)
-            template (get template-map template-id)]
+      (doseq [[i slide] (map-indexed vector slides)]
+        (let [t-id (or (:template-id slide) default-id)
+              template (get template-map t-id)]
+          (when-not template
+            (throw (ex-info (str "Slide " (inc i) " uses unknown template '" t-id "'.") {})))
 
-        (when-not template
-          (throw (ex-info (str "Validation Failed: Slide " (inc i)
-                               " ('" (:title slide) "') uses non-existent template-id '"
-                               template-id "'.")
-                          {:slide (inc i) :template-id template-id})))
-
-        (let [expected-count (count (:elements template))
-              provided-count (count (:markdown-blocks slide))]
-          (when (< provided-count expected-count) ; <-- MUDANÇA AQUI
-            (throw (ex-info (str "Validation Failed: Slide " (inc i)
-                                 " ('" (:title slide) "') for template '" (:template-name template)
-                                 "' expects at least " expected-count " content block(s), but "
-                                 provided-count " were provided.")
-                            {:slide (inc i)
-                             :template-name (:template-name template)
-                             :expected expected-count
-                             :provided provided-count})))))))
+          (let [expected (count (:elements template))
+                provided (count (:markdown-blocks slide))]
+            (when (< provided expected)
+              (throw (ex-info (str "Slide " (inc i) " expects at least " expected
+                                   " blocks, but provided " provided ".") {}))))))))
   presentation-data)
 
 ;; --- Media & Style Generation ---
 
-(defn- guess-mime-type
-  "Guesses MIME type from file path. Add more as needed."
-  [path]
-  (let [ext (second (re-find #"\.([a-zA-Z0-9]+)$" path))]
-    (case (str/lower-case ext)
-      "png" "image/png"
-      "jpg" "image/jpeg"
-      "jpeg" "image/jpeg"
-      "gif" "image/gif"
-      "svg" "image/svg+xml"
-      "webp" "image/webp"
-      "mp4" "video/mp4"
-      "webm" "video/webm"
-      "ogg" "video/ogg"
-      "application/octet-stream"))) ; Default
+(def mime-types
+  {"png" "image/png" "jpg" "image/jpeg" "jpeg" "image/jpeg"
+   "gif" "image/gif" "svg" "image/svg+xml" "webp" "image/webp"
+   "mp4" "video/mp4" "webm" "video/webm" "ogg" "video/ogg"})
 
-(defn- encode-file-to-base64
-  "Reads a file and returns its Base64-encoded string."
-  [base-dir file-path]
+(defn- guess-mime-type [path]
+  (let [ext (second (re-find #"\.([a-zA-Z0-9]+)$" path))]
+    (get mime-types (str/lower-case (or ext "")) "application/octet-stream")))
+
+(defn- encode-file-to-base64 [base-dir file-path]
   (let [file (io/file base-dir file-path)]
-    (if-not (.exists file)
-      (throw (ex-info (str "Media file not found: " file-path)
-                      {:path (str file)})))
-    (with-open [in (FileInputStream. file)
-                out (ByteArrayOutputStream.)]
+    (when-not (.exists file)
+      (throw (ex-info (str "Media file not found: " file-path) {:path (str file)})))
+    (with-open [in (FileInputStream. file) out (ByteArrayOutputStream.)]
       (io/copy in out)
       (.encodeToString (Base64/getEncoder) (.toByteArray out)))))
 
-(defn- extract-image-path
-  "Extracts path from markdown image syntax ![alt](path)."
-  [markdown-block]
-  (or (second (re-find #"!\[.*\]\((.*?)\)" markdown-block))
-      markdown-block)) ; Fallback if just a path
+(defn- extract-image-path [block]
+  (or (second (re-find #"!\[.*\]\((.*?)\)" block)) block))
 
-(defn- build-css-gradient
-  "Creates a linear-gradient CSS string from template background."
-  [{:keys [orientation layers]}]
-  (let [direction (if (= "vertical" orientation) "to right" "to bottom")
-        stops (loop [remaining layers
-                     current-pos 0.0
-                     acc []]
-                (if-let [layer (first remaining)]
-                  (let [prop (Double/parseDouble (str/replace (:proportion layer) "%" ""))
-                        next-pos (+ current-pos prop)]
-                    (recur (rest remaining)
-                           next-pos
-                           (conj acc (str (:color layer) " " current-pos "% " next-pos "%"))))
-                  acc))]
-    (str "linear-gradient(" direction ", " (str/join ", " stops) ")")))
+(defn- build-css-gradient [{:keys [orientation layers]}]
+  (let [dir (if (= "vertical" orientation) "to right" "to bottom")
+        [stops] (reduce (fn [[acc cur] {:keys [color proportion]}]
+                          (let [p (Double/parseDouble (str/replace proportion "%" ""))
+                                next (+ cur p)]
+                            [(conj acc (str color " " cur "% " next "%")) next]))
+                        [[] 0.0]
+                        layers)]
+    (str "linear-gradient(" dir ", " (str/join ", " stops) ")")))
 
-(defn- build-position-style
-  "Creates CSS position styles from a template element."
-  [element]
-  (let [pos (:position element)
-        font (:style element)]
-    (str "position: absolute; "
-         (when (:x pos) (str "left: " (:x pos) "; "))
-         (when (:y pos) (str "top: " (:y pos) "; "))
-         (when (:color font) (str "color: " (:color font) "; "))
-         (when (:alignment font) (str "text-align: " (:alignment font) "; ")))))
+(defn- build-position-style [{:keys [position style]}]
+  (str "position: absolute; "
+       (when (:x position) (str "left: " (:x position) "; "))
+       (when (:y position) (str "top: " (:y position) "; "))
+       (when (:color style) (str "color: " (:color style) "; "))
+       (when (:alignment style) (str "text-align: " (:alignment style) "; "))))
 
 ;; --- HTML Generation ---
 
-(defn- generate-slide-content
-  "Generates HTML for the content elements of a single slide."
-  [template-elements markdown-blocks base-dir]
-  (let [elements template-elements
-        blocks markdown-blocks
-        element-count (count elements)
-        block-count (count blocks)
-        pairs (cond
-                (>= block-count element-count)
-                (let [last-element-index (dec element-count)
-                      head-elements (take last-element-index elements)
-                      head-blocks (take last-element-index blocks)
-                      head-pairs (map vector head-elements head-blocks)
-                      last-element (nth elements last-element-index)
-                      remaining-blocks (drop last-element-index blocks)
-                      last-block (str/join "\n\n" remaining-blocks)
-                      last-pair [last-element last-block]]
-                  (vec (conj (vec head-pairs) last-pair)))
-                :else
-                (map vector elements blocks))]
+(defn- pair-greedy [elements blocks]
+  (let [idx (dec (count elements))
+        [head-els [last-el]] (split-at idx elements)
+        [head-bls tail-bls]  (split-at idx blocks)]
+    (conj (vec (map vector head-els head-bls))
+          [last-el (str/join "\n\n" tail-bls)])))
 
-    (str/join "\n"
-              (map (fn [[element block]]
-                     (when block
-                       (let [style (build-position-style element)]
-                         (case (:type element)
-                           "text"
-                           (let [raw-html (md/md-to-html-string block :spec :gfm)
-                                 fixed-html (str/replace raw-html
-                                                         #"<code class=\"(\w+)\">"
-                                                         "<code class=\"language-$1\">")]
-                             (str "<div class=\"content-element text-content\" style=\"" style "\">"
-                                  fixed-html
-                                  "</div>"))
+(defn- pair-elements-with-blocks [elements blocks]
+  (if (>= (count blocks) (count elements))
+    (pair-greedy elements blocks)
+    (map vector elements blocks)))
 
-                           "image"
-                           (let [path (extract-image-path block)
-                                 mime (guess-mime-type path)
-                                 b64 (encode-file-to-base64 base-dir path)]
-                             (str "<div class=\"content-element image-content\" style=\"" style "\">"
-                                  "<img src=\"data:" mime ";base64," b64 "\" alt=\"Embedded Image\">"
-                                  "</div>"))
+(defmulti render-slide-element (fn [element _ _] (:type element)))
 
-                           "video"
-                           (let [path block
-                                 mime (guess-mime-type path)
-                                 b64 (encode-file-to-base64 base-dir path)
-                                 controls (if (false? (:controls element)) "" "controls")
-                                 autoplay (if (:autoplay element) "autoplay muted" "")]
-                             (str "<div class=\"content-element video-content\" style=\"" style "\">"
-                                  "<video " controls " " autoplay " src=\"data:" mime ";base64," b64 "\">"
-                                  "Your browser does not support the video tag."
-                                  "</video></div>"))
+(defmethod render-slide-element "text" [element block _]
+  (let [style (build-position-style element)
+        html (md/md-to-html-string block :spec :gfm)]
+    (str "<div class=\"content-element text-content\" style=\"" style "\">"
+         (str/replace html #"<code class=\"(\w+)\">" "<code class=\"language-$1\">")
+         "</div>")))
 
-                           (str "<div style=\"" style "\">Unsupported element type: " (:type element) "</div>")))))
-                   pairs))))
+(defmethod render-slide-element "image" [element block base-dir]
+  (let [style (build-position-style element)
+        path (extract-image-path block)
+        mime (guess-mime-type path)
+        b64 (encode-file-to-base64 base-dir path)]
+    (str "<div class=\"content-element image-content\" style=\"" style "\">"
+         "<img src=\"data:" mime ";base64," b64 "\" alt=\"Embedded Image\"></div>")))
 
-(defn- generate-slide-html
-  "Generates HTML for a single slide."
-  [slide index template-map default-template-id base-dir]
-  (let [template-id (or (:template-id slide) default-template-id)
-        template (get template-map template-id)
-        background-style (build-css-gradient (:background template))]
-    (str "<div class=\"slide\" id=\"slide-" index "\" style=\"background: " background-style ";\">"
+(defmethod render-slide-element "video" [element block base-dir]
+  (let [style (build-position-style element)
+        mime (guess-mime-type block)
+        b64 (encode-file-to-base64 base-dir block)
+        opts (str (when-not (false? (:controls element)) "controls ")
+                  (when (:autoplay element) "autoplay muted"))]
+    (str "<div class=\"content-element video-content\" style=\"" style "\">"
+         "<video " opts " src=\"data:" mime ";base64," b64 "\"></video></div>")))
+
+(defmethod render-slide-element :default [element _ _]
+  (str "<div style=\"" (build-position-style element) "\">Unsupported: " (:type element) "</div>"))
+
+(defn- generate-slide-content [template-elements markdown-blocks base-dir]
+  (str/join "\n" (for [[el bl] (pair-elements-with-blocks template-elements markdown-blocks)
+                       :when bl]
+                   (render-slide-element el bl base-dir))))
+
+(defn- generate-slide-html [slide index template-map default-id base-dir]
+  (let [template (get template-map (or (:template-id slide) default-id))
+        bg (build-css-gradient (:background template))]
+    (str "<div class=\"slide\" id=\"slide-" index "\" style=\"background: " bg ";\">"
          (generate-slide-content (:elements template) (:markdown-blocks slide) base-dir)
          "</div>")))
 
-(defn- generate-slide-options
-  "Generates <option> tags for the slide navigation dropdown."
-  [slides]
-  (str/join "\n"
-            (map-indexed
-             (fn [i slide]
-               (let [title (or (:title slide) (str "Slide " (inc i)))
-                     label (if (:title slide)
-                             (str (inc i) " - " title)
-                             (str (inc i)))]
-                 (str "<option value=\"" i "\">" label "</option>")))
-             slides)))
+(defn- generate-slide-options [slides]
+  (str/join "\n" (map-indexed (fn [i s]
+                                (let [label (if (:title s) (str (inc i) " - " (:title s)) (str (inc i)))]
+                                  (str "<option value=\"" i "\">" label "</option>")))
+                              slides)))
 
-(defn- generate-css
-  "Generates the embedded CSS for the presentation."
-  []
-  (let [prism-css (fetch-cdn-asset "https://cdnjs.cloudflare.com/ajax/libs/prism/1.30.0/themes/prism-okaidia.min.css"
-                                   "prism-okaidia.min.css")]
-    (str "
-    <style>
-      " prism-css " /* CSS do Prism.js embutido */
-
-      /* Seus estilos originais */
+(defn- generate-css []
+  (let [prism-css (fetch-cdn-asset "https://cdnjs.cloudflare.com/ajax/libs/prism/1.30.0/themes/prism-okaidia.min.css" "prism-okaidia.min.css")]
+    (str "<style>" prism-css "
       body, html { margin: 0; padding: 0; height: 100%; width: 100%; overflow: hidden; background-color: #111; }
-      #presentation-container {
-        display: flex;
-        justify-content: center;
-        align-items: center;
-        width: 100%;
-        height: 100%;
-      }
-      #viewport {
-        width: 100vw;
-        height: 56.25vw; /* 16:9 aspect ratio */
-        max-height: 100vh;
-        max-width: 177.78vh; /* 16:9, 100vh * 16/9 */
-        position: relative;
-        overflow: hidden;
-        background-color: #000;
-        box-shadow: 0 0 20px rgba(0,0,0,0.5);
-      }
-      .slide {
-        width: 100%;
-        height: 100%;
-        font-size: 4.2vh;
-        position: absolute;
-        top: 0;
-        left: 0;
-        opacity: 0;
-        visibility: hidden;
-        transition: opacity 0.5s ease-in-out, visibility 0.5s;
-      }
-      .slide.active {
-        opacity: 1;
-        visibility: visible;
-        z-index: 1;
-      }
-      .content-element {
-        box-sizing: border-box;
-        padding: 1em; /* Mantém o padding lateral e inferior */
-        padding-top: 0; /* CORREÇÃO: Remove o padding superior */
-      }
-      .text-content h1, .text-content h2, .text-content h3, .text-content h4, .text-content h5, .text-content p, .text-content ul, .text-content ol {
-        margin: 0.5em 0; /* Mantém a margem inferior para espaçar parágrafos */
-        margin-top: 0; /* CORREÇÃO: Remove a margem superior */
-      }
-      /* Ensure embedded media scales correctly */
-      .content-element img, .content-element video {
-        max-width: 100%;
-        max-height: 100%;
-        height: auto;
-        width: auto;
-        display: block;
-      }
-      /* Navigation Menu */
-      #nav-menu {
-        position: fixed;
-        top: 15px;
-        left: 15px;
-        z-index: 100;
-        background-color: rgba(0,0,0,0.7);
-        border-radius: 5px;
-        padding: 8px;
-        display: flex;
-        gap: 5px;
-        opacity: 1;
-        transition: opacity 0.3s ease-in-out;
-      }
-      #nav-menu.hidden {
-        opacity: 0;
-        pointer-events: none;
-      }
-      #nav-menu button, #nav-menu select {
-        background-color: #444;
-        color: white;
-        border: none;
-        border-radius: 3px;
-        padding: 5px 8px;
-        cursor: pointer;
-        font-size: 16px;
-      }
-      #nav-menu button:hover, #nav-menu select:hover {
-        background-color: #666;
-      }
-      
-      /* Ajuste opcional para o fundo do código */
-      pre[class*=\"language-\"] {
-        background: transparent; /* Remove o fundo do Prism para usar o fundo do slide */
-        margin: 0;
-      }
-    </style>
-  ")))
+      #presentation-container { display: flex; justify-content: center; align-items: center; width: 100%; height: 100%; }
+      #viewport { width: 100vw; height: 56.25vw; max-height: 100vh; max-width: 177.78vh; position: relative; overflow: hidden; background-color: #000; box-shadow: 0 0 20px rgba(0,0,0,0.5); }
+      .slide { width: 100%; height: 100%; font-size: 4.2vh; position: absolute; top: 0; left: 0; opacity: 0; visibility: hidden; transition: opacity 0.5s, visibility 0.5s; }
+      .slide.active { opacity: 1; visibility: visible; z-index: 1; }
+      .content-element { box-sizing: border-box; padding: 1em 1em 1em 1em; padding-top: 0; }
+      .text-content h1, .text-content h2, .text-content p, .text-content ul { margin: 0.5em 0; margin-top: 0; }
+      .content-element img, .content-element video { max-width: 100%; max-height: 100%; display: block; margin: auto; }
+      #nav-menu { position: fixed; top: 15px; left: 15px; z-index: 100; background-color: rgba(0,0,0,0.7); border-radius: 5px; padding: 8px; display: flex; gap: 5px; transition: opacity 0.3s; }
+      #nav-menu.hidden { opacity: 0; pointer-events: none; }
+      #nav-menu button, #nav-menu select { background-color: #444; color: white; border: none; border-radius: 3px; padding: 5px 8px; cursor: pointer; font-size: 16px; }
+      pre[class*=\"language-\"] { background: transparent; margin: 0; }
+    </style>")))
 
-(defn- generate-js
-  "Generates the embedded JavaScript for navigation."
-  [slide-count]
-  (let [prism-core-js (fetch-cdn-asset "https://cdnjs.cloudflare.com/ajax/libs/prism/1.30.0/prism.min.js"
-                                       "prism-core.min.js")
-        prism-clojure-js (fetch-cdn-asset "https://cdnjs.cloudflare.com/ajax/libs/prism/1.30.0/components/prism-clojure.min.js"
-                                          "prism-clojure.min.js")]
-    (str
-     ;; Libs
-     "<script>"
-     prism-core-js
-     "\n"
-     prism-clojure-js
-     "</script>"
+(defn- generate-js [count]
+  (let [core (fetch-cdn-asset "https://cdnjs.cloudflare.com/ajax/libs/prism/1.30.0/prism.min.js" "prism-core.min.js")
+        clj  (fetch-cdn-asset "https://cdnjs.cloudflare.com/ajax/libs/prism/1.30.0/components/prism-clojure.min.js" "prism-clojure.min.js")]
+    (str "<script>" core "\n" clj "</script>"
+         "<script>
+          let currentSlide = 0; const total = " count ";
+          const slides = document.querySelectorAll('.slide');
+          const select = document.getElementById('slide-select');
+          const menu = document.getElementById('nav-menu');
+          let timer;
+          function show(idx) {
+            if (idx < 0 || idx >= total) return;
+            slides[currentSlide].classList.remove('active');
+            currentSlide = idx;
+            slides[currentSlide].classList.add('active');
+            if (select) select.value = currentSlide;
+          }
+          function next() { show(currentSlide + 1); }
+          function prev() { show(currentSlide - 1); }
+          function menuVis() {
+            menu.classList.remove('hidden');
+            clearTimeout(timer);
+            timer = setTimeout(() => menu.classList.add('hidden'), 3000);
+          }
+          document.addEventListener('keydown', e => {
+            if (e.key === 'ArrowRight') next();
+            if (e.key === 'ArrowLeft') prev();
+          });
+          document.addEventListener('mousemove', menuVis);
+          document.getElementById('btn-prev').addEventListener('click', prev);
+          document.getElementById('btn-next').addEventListener('click', next);
+          document.getElementById('btn-fullscreen').addEventListener('click', () => {
+            (!document.fullscreenElement) ? document.documentElement.requestFullscreen() : document.exitFullscreen();
+          });
+          select.addEventListener('change', e => show(parseInt(e.target.value)));
+          show(0); menuVis(); Prism.highlightAll();
+         </script>")))
 
-     ;; Slide logic
-     "<script>
-      let currentSlide = 0;
-      const totalSlides = " slide-count ";
-      const slides = document.querySelectorAll('.slide');
-      const slideSelect = document.getElementById('slide-select');
-      const navMenu = document.getElementById('nav-menu');
-      let hideMenuTimer;
-
-      function showSlide(index) {
-        if (index < 0 || index >= totalSlides) return;
-        
-        slides[currentSlide].classList.remove('active');
-        currentSlide = index;
-        slides[currentSlide].classList.add('active');
-        
-        if (slideSelect) {
-          slideSelect.value = currentSlide;
-        }
-      }
-
-      function nextSlide() { showSlide(currentSlide + 1); }
-      function prevSlide() { showSlide(currentSlide - 1); }
-
-      function toggleFullscreen() {
-        if (!document.fullscreenElement) {
-          document.documentElement.requestFullscreen();
-        } else if (document.exitFullscreen) {
-          document.exitFullscreen();
-        }
-      }
-
-      function showMenu() {
-        navMenu.classList.remove('hidden');
-        clearTimeout(hideMenuTimer);
-        hideMenuTimer = setTimeout(() => {
-          navMenu.classList.add('hidden');
-        }, 5000); // Hide after 5 seconds of inactivity
-      }
-
-      // Event Listeners
-      document.addEventListener('keydown', (e) => {
-        if (e.key === 'ArrowRight') nextSlide();
-        if (e.key === 'ArrowLeft') prevSlide();
-      });
-
-      document.addEventListener('mousemove', showMenu);
-      
-      document.getElementById('btn-prev').addEventListener('click', prevSlide);
-      document.getElementById('btn-next').addEventListener('click', nextSlide);
-      document.getElementById('btn-fullscreen').addEventListener('click', toggleFullscreen);
-      
-      slideSelect.addEventListener('change', (e) => {
-        showSlide(parseInt(e.target.value, 10));
-      });
-
-      // Initial setup
-      showSlide(0);
-      showMenu();
-      Prism.highlightAll(); // <-- NOVO: Roda o coloridor
-    </script>
-  ")))
-
-(defn generate-html
-  "Generates the final self-contained HTML file."
-  [{:keys [meta slides]} base-dir]
+(defn generate-html [{:keys [meta slides]} base-dir]
   (let [template-map (get-template-map (:templates meta))
-        default-template-id (-> meta :templates first :slide-template)]
-    (str "<!DOCTYPE html>"
-         "<html lang=\"en\">"
-         "<head>"
-         "<meta charset=\"UTF-8\">"
+        default-id (-> meta :templates first :slide-template)]
+    (str "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"UTF-8\">"
          "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">"
          "<title>" (or (:title meta) "Presentation") "</title>"
-         (generate-css)
-         "</head>"
-         "<body>"
+         (generate-css) "</head><body>"
          "<div id=\"nav-menu\">"
-         "<button id=\"btn-prev\" title=\"Previous Slide\">&#9664;</button>"
-         "<button id=\"btn-next\" title=\"Next Slide\">&#9654;</button>"
-         "<select id=\"slide-select\">"
-         (generate-slide-options slides)
-         "</select>"
-         "<button id=\"btn-fullscreen\" title=\"Toggle Fullscreen\">&#x26F6;</button>"
-         "</div>"
-         "<div id=\"presentation-container\">"
-         "<div id=\"viewport\">"
-         (str/join "\n"
-                   (map-indexed
-                    (fn [i slide]
-                      (generate-slide-html slide i template-map default-template-id base-dir))
-                    slides))
-         "</div>"
-         "</div>"
-         (generate-js (count slides))
-         "</body>"
-         "</html>")))
+         "<button id=\"btn-prev\">&#9664;</button><button id=\"btn-next\">&#9654;</button>"
+         "<select id=\"slide-select\">" (generate-slide-options slides) "</select>"
+         "<button id=\"btn-fullscreen\">&#x26F6;</button></div>"
+         "<div id=\"presentation-container\"><div id=\"viewport\">"
+         (str/join "\n" (map-indexed #(generate-slide-html %2 %1 template-map default-id base-dir) slides))
+         "</div></div>" (generate-js (count slides)) "</body></html>")))
 
-;; --- Main Execution ---
+(defn -main [& args]
+  (if-let [input-file (first args)]
+    (try
+      (let [file (io/file input-file)]
+        (if (.exists file)
+          (let [path (.getCanonicalPath file)
+                output (str/replace input-file #"\.smd$" ".html")
+                data (-> (slurp path) parse-smd-file validate-presentation-data)]
+            (println "Generating HTML...")
+            (spit output (generate-html data (.getParent (io/file path))))
+            (println "Success:" output))
+          (println "Error: File not found.")))
+      (catch Exception e (println "Error:" (.getMessage e)) (.printStackTrace e)))
+    (println "Usage: ./slide-markdown.clj <input.smd>")))
 
-(defn -main
-  "Main entry point for the script."
-  [& args]
-  (let [input-file (first args)]
-    (if-not input-file
-      (println "Usage: ./slide-markdown.clj <input.smd>")
-      (try
-        (let [file (io/file input-file)]
-          (if-not (.exists file)
-            (println (str "Error: File not found: " input-file))
-            (let [input-path (.getCanonicalPath file)
-                  base-dir (.getParent (io/file input-path))
-                  output-file (str/replace input-file #"\.smd$" ".html")
-                  file-content (slurp input-path)]
-
-              (println (str "Parsing " input-file "..."))
-              (let [presentation-data (-> file-content
-                                          (parse-smd-file)
-                                          (validate-presentation-data))]
-
-                (println "Generating HTML...")
-                (let [html-output (generate-html presentation-data base-dir)]
-                  (spit output-file html-output)
-                  (println (str "Success! Wrote presentation to " output-file)))))))
-        (catch clojure.lang.ExceptionInfo e
-          (println (str "Error: " (.getMessage e)))
-          (println "Data:" (ex-data e)))
-        (catch Exception e
-          (println (str "An unexpected error occurred: " (.getMessage e)))
-          (.printStackTrace e))))))
-
-;; Run -main if script is executed
-(when (= *file* (System/getProperty "babashka.file"))
-  (apply -main *command-line-args*))
+(when (= *file* (System/getProperty "babashka.file")) (apply -main *command-line-args*))
