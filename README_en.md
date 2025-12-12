@@ -44,10 +44,10 @@ You need **Babashka** installed to run this tool.
 
 ```bash
 # If you set up a bb.edn (Recommended)
-bb slide_markdown.clj presentation.smd
+bb -f src/slide_markdown.clj presentation.smd
 
 # Or running directly
-./slide_markdown.clj presentation.smd
+bb -f src/slide_markdown.clj presentation.smd
 ```
 
 3.  Open the generated `presentation.html` in your browser.
@@ -69,6 +69,9 @@ bb watch presentation.smd
 
 # Start Clojure HTTP server with live reload
 bb serve [port] [file.smd]  # default port: 8080
+
+# Start REPL
+bb --nrepl-server [port]
 ```
 
 ### Live Development Workflow
