@@ -162,7 +162,7 @@ END
 4.  **Funcional:** Map, Filter, Reduce
 5.  **Composição:** Threading Macros
 6.  **Prática:** Estado e Java Interop
-7.  **Hands-on:** Geração de slides com IA generativa
+7.  **Hands-on:** Criação do encurtador de URL em Clojure
 
 -*-*- O que é Clojure?
 # O que é Clojure?
