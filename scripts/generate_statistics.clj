@@ -46,17 +46,16 @@
         submissions (:content data)]
     (when submissions
       (let [all-answers (mapcat (comp vals :answers) submissions)
-            relevant-answers (filter #(and (:prettyFormat %)
+            relevant-answers (filter #(and (:answer %)
                                            (not (contains? irrelevant-question-ids (:order %))))
                                      all-answers)
             questions-grouped (group-by :text relevant-answers)
             treat-answers-fn (fn [[question-text answers]]
-                               (let [answer-frequencies (frequencies (map :prettyFormat answers))
+                               (let [answer-frequencies (frequencies (map :answer answers))
                                      sorted-answers (sort-by second > answer-frequencies)]
                                  {:question question-text
                                   :total-responses (count answers)
                                   :answers (into {} sorted-answers)}))]
-
         {:total-submissions (count submissions)
          :questions (map treat-answers-fn questions-grouped)}))))
 

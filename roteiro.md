@@ -8,12 +8,10 @@
 bb serve 3000 ws-clojure.smd
 ```
 
-
 2. Habilitar live reload
 ```sh
 bb watch ws-clojure.smd
 ```
-
 
 3. Conectar no REPL
 
